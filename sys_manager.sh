@@ -11,9 +11,36 @@ CYAN="${ORANGE}"
 NC='\033[0m'
 BOLD='\033[1m'
 
+ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
+err()  { echo -e "${RED}[ERR]${NC} $*" >&2; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+info() { echo -e "${ORANGE}[INFO]${NC} $*"; }
+title(){ echo -e "\n${BOLD}${ORANGE}==== $* ====${NC}\n"; }
+pause(){ read -r -p "按回车返回菜单..." _ || true; }
+ask_yn_default_yes() {
+  local a; printf '%s [Y/n]: ' "$1"; read -r a || true; a="${a:-y}"
+  case "${a,,}" in y|yes|"") return 0 ;; *) return 1 ;; esac
+}
+ask_yn_default_no() {
+  local a; printf '%s [y/N]: ' "$1"; read -r a || true; a="${a:-n}"
+  case "${a,,}" in y|yes) return 0 ;; *) return 1 ;; esac
+}
+validate_username() {
+  local u="$1"
+  [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { err "用户名不合法: $u"; return 1; }
+}
+
+
 CF_TOKEN_FILE="${CF_TOKEN_FILE:-/etc/cloudflared/tunnel.token}"
 CF_DIR="${CF_DIR:-/etc/cloudflared}"
 S6_SCAN_DIR="${S6_SCAN_DIR:-/run/service}"
+LAST_USER=""
+LAST_PASS=""
+QUICK_SSH_USER="${QUICK_SSH_USER:-kkb}"
+QUICK_SSH_PID="${QUICK_SSH_PID:-/run/sys-mgr-quick-ssh.pid}"
+QUICK_SSH_LOG="${QUICK_SSH_LOG:-/var/log/sys-mgr-quick-ssh.log}"
+QUICK_SSH_URL="${QUICK_SSH_URL:-/run/sys-mgr-quick-ssh.url}"
+SSHD_CONFIG="${SSHD_CONFIG:-/etc/ssh/sshd_config}"
 
 # 确保以 root 用户运行
 if [ "$EUID" -ne 0 ]; then
@@ -117,13 +144,27 @@ get_supervisor_conf_dir() {
   if [ -f "$cfg" ]; then
     all_found=$(_supervisor_dirs_from_main_conf "$cfg")
     if picked=$(_supervisor_pick_from_dirs "$all_found"); then
-      # 来源：进程主 conf 的 include（CloudStudio 走这里）
+      # 来源：进程主 conf 的 include（CloudStudio 标准路径仍优先）
       echo "$picked"
+      return 0
+    fi
+    # 有 -c 主 conf，但无 [include] 或 include 目录均不存在：
+    # 用主 conf 同级 conf.d / 主 conf 目录（兼容 /.随机串/.../supervisord-conf/）
+    # 不影响上面 include→pref 成功路径
+    local cfg_dir conf_d
+    cfg_dir=$(dirname "$cfg")
+    conf_d="${cfg_dir}/conf.d"
+    if mkdir -p "$conf_d" 2>/dev/null && [ -w "$conf_d" ]; then
+      echo "$conf_d"
+      return 0
+    fi
+    if [ -n "$cfg_dir" ] && [ "$cfg_dir" != "." ] && mkdir -p "$cfg_dir" 2>/dev/null && [ -w "$cfg_dir" ]; then
+      echo "$cfg_dir"
       return 0
     fi
   fi
 
-  # ---------- ② 其它常见主 conf：仍读 include，不扫垃圾目录里的 conf ----------
+  # ---------- ② 其它常见主 conf：仍读 include；失败则 conf 旁 conf.d ----------
   local try_cfg
   for try_cfg in \
     /etc/supervisord.conf \
@@ -133,17 +174,23 @@ get_supervisor_conf_dir() {
     /etc/supervisor.conf
   do
     [ -f "$try_cfg" ] || continue
-    # 已试过 cmdline 的 cfg 则跳过
     [ "$try_cfg" = "$cfg" ] && continue
     all_found=$(_supervisor_dirs_from_main_conf "$try_cfg")
     if picked=$(_supervisor_pick_from_dirs "$all_found"); then
       echo "$picked"
       return 0
     fi
+    # 无 include：主 conf 旁 conf.d
+    local td tdd
+    td=$(dirname "$try_cfg")
+    tdd="${td}/conf.d"
+    if mkdir -p "$tdd" 2>/dev/null && [ -w "$tdd" ]; then
+      echo "$tdd"
+      return 0
+    fi
   done
 
-  # ---------- ③ 最后兜底：固定目录（仅当完全解析不到 include 时）----------
-  # 优先可写，降低写到只读垃圾路径的概率
+  # ---------- ③ 最后兜底：固定目录（仅当完全解析不到时）----------
   local cand
   for cand in \
     "$pref" \
@@ -1367,6 +1414,224 @@ menu_s6_relink() {
   find_s6_boot_hook_dirs | sed 's/^/    /' || echo "    (无)"
 }
 
+
+# ==============================================================================
+# auto_ssh 扩展菜单（追加，不改动 1-5/7 核心）
+# ==============================================================================
+create_user_with_password() {
+  local user="$1" pass="$2" shell="${3:-/bin/bash}" create_home="${4:-1}"
+  validate_username "$user" || return 1
+  if id "$user" &>/dev/null; then
+    warn "用户已存在: $user"
+    if ask_yn_default_yes "是否只更新密码?"; then
+      echo "${user}:${pass}" | chpasswd && ok "已更新密码: $user"
+    else info "跳过"; fi
+  else
+    if [ "$create_home" = "1" ]; then useradd -m -s "$shell" "$user"
+    else useradd -M -s "$shell" "$user"; fi
+    echo "${user}:${pass}" | chpasswd
+    ok "已创建用户: $user"
+  fi
+  local g=""
+  getent group sudo &>/dev/null && g=sudo
+  [ -z "$g" ] && getent group wheel &>/dev/null && g=wheel
+  if [ -n "$g" ] && ask_yn_default_yes "是否将 ${user} 加入 ${g} 组?"; then
+    usermod -aG "$g" "$user" 2>/dev/null || true
+    ok "已加入 $g"
+    if command -v sudo &>/dev/null && [ -d /etc/sudoers.d ] && ask_yn_default_yes "是否配置 sudo 免密?"; then
+      echo "${user} ALL=(ALL) NOPASSWD:ALL" >"/etc/sudoers.d/${user}"
+      chmod 440 "/etc/sudoers.d/${user}"
+      ok "已写 /etc/sudoers.d/${user}"
+    fi
+  fi
+  LAST_USER="$user"; LAST_PASS="$pass"
+}
+
+sm_create_user() {
+  clear; title "新建用户名和密码"
+  local user p1 p2
+  printf '%s' "用户名: "; read -r user
+  validate_username "$user" || { pause; return; }
+  while true; do
+    printf '%s' "密码: "; stty -echo; read -r p1; stty echo; echo
+    printf '%s' "再输一次: "; stty -echo; read -r p2; stty echo; echo
+    [ -z "$p1" ] && { err "密码不能为空"; continue; }
+    [ "$p1" != "$p2" ] && { err "两次不一致"; continue; }
+    break
+  done
+  create_user_with_password "$user" "$p1" "/bin/bash" 1 || true
+  pause
+}
+
+sm_ssh_password_policy() {
+  clear; title "检查 SSH + 密码登录"
+  prepare_ssh_for_tunnel
+  echo
+  local bin; bin="$(sshd_bin)"
+  echo "配置: ${SSHD_CONFIG:-/etc/ssh/sshd_config}"
+  if [ -n "$bin" ]; then
+    echo "sshd -T 摘要:"
+    "$bin" -T 2>/dev/null | grep -E '^(passwordauthentication|kbdinteractiveauthentication|pubkeyauthentication|permitrootlogin|usepam) ' | sed 's/^/  /' || true
+  fi
+  port_22_listening && ok ":22 在监听" || warn ":22 未监听"
+  pause
+}
+
+sm_local_ssh_test() {
+  clear; title "本机验证 SSH"
+  local user
+  printf '%s' "用户名 [${LAST_USER:-root}]: "; read -r user
+  user="${user:-${LAST_USER:-root}}"
+  if ! id "$user" &>/dev/null; then err "用户不存在: $user"; pause; return; fi
+  prepare_ssh_for_tunnel
+  if ! port_22_listening; then err ":22 未监听"; pause; return; fi
+  info "ssh ${user}@127.0.0.1"
+  if [ -n "${LAST_PASS:-}" ] && [ "$user" = "$LAST_USER" ] && command -v sshpass &>/dev/null; then
+    if ask_yn_default_yes "用 sshpass 自动验证?"; then
+      sshpass -p "$LAST_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+        -o ConnectTimeout=8 "${user}@127.0.0.1" "echo OK && id" && ok "验证成功" || err "验证失败"
+      pause; return
+    fi
+  fi
+  set +e
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+    -o ConnectTimeout=10 "${user}@127.0.0.1"
+  local rc=$?; set -e
+  [ $rc -eq 0 ] && ok "会话正常结束" || warn "退出码 $rc"
+  pause
+}
+
+sm_cf_status() {
+  clear; title "查看 CF 状态"
+  cf_list_tunnels
+  pause
+}
+
+sm_cf_logs() {
+  clear; title "查看 CF 日志"
+  local f="/var/log/cloudflared.log"
+  if [ -f "$f" ]; then
+    echo "--- tail -50 $f ---"
+    tail -50 "$f"
+    echo
+    if ask_yn_default_no "跟随日志 tail -f?"; then tail -f "$f"; fi
+  else
+    warn "无 $f"
+    journalctl -u cloudflared -n 40 --no-pager 2>/dev/null || true
+  fi
+  pause
+}
+
+sm_uninstall_cf() {
+  clear; title "卸载 CF 隧道"
+  ask_yn_default_no "确认卸载本地 cloudflared 注册与进程?" || { info "取消"; pause; return; }
+  pkill -f 'cloudflared.*tunnel' 2>/dev/null || true
+  if command -v s6-svc >/dev/null 2>&1 && [ -e /run/service/svc-cloudflared ]; then
+    s6-svc -d /run/service/svc-cloudflared 2>/dev/null || true
+    s6-svc -x /run/service/svc-cloudflared 2>/dev/null || true
+    rm -f /run/service/svc-cloudflared
+  fi
+  rm -rf /opt/svc/cloudflared/s6 2>/dev/null || true
+  rm -f /opt/svc/cloudflared/supervisor.sh /opt/svc/cloudflared/.pid 2>/dev/null || true
+  systemctl stop cloudflared 2>/dev/null || true
+  systemctl disable cloudflared 2>/dev/null || true
+  rm -f /etc/systemd/system/cloudflared.service
+  systemctl daemon-reload 2>/dev/null || true
+  local dir; dir=$(get_supervisor_conf_dir 2>/dev/null || true)
+  [ -n "$dir" ] && rm -f "$dir/cloudflared.conf"
+  if command -v crontab &>/dev/null; then
+    (crontab -l 2>/dev/null | grep -v cloudflared || true) | crontab - 2>/dev/null || true
+  fi
+  ask_yn_default_yes "删除 Token ${CF_TOKEN_FILE}?" && rm -f "${CF_TOKEN_FILE}"
+  ask_yn_default_no "删除目录 ${CF_DIR}?" && rm -rf "${CF_DIR}"
+  ask_yn_default_no "卸载 cloudflared 二进制?" && rm -f /usr/local/bin/cloudflared /usr/bin/cloudflared /root/cloudflared
+  ok "本地 CF 清理完成"
+  pause
+}
+
+sm_change_user_password() {
+  clear; title "修改普通用户密码"
+  local user p1 p2
+  printf '%s' "用户名 [${LAST_USER:-}]: "; read -r user
+  user="${user:-$LAST_USER}"
+  validate_username "$user" || { pause; return; }
+  id "$user" &>/dev/null || { err "用户不存在"; pause; return; }
+  while true; do
+    printf '%s' "新密码: "; stty -echo; read -r p1; stty echo; echo
+    printf '%s' "再输一次: "; stty -echo; read -r p2; stty echo; echo
+    [ -z "$p1" ] && { err "不能为空"; continue; }
+    [ "$p1" != "$p2" ] && { err "不一致"; continue; }
+    break
+  done
+  echo "${user}:${p1}" | chpasswd
+  ok "已更新: $user"
+  LAST_USER="$user"; LAST_PASS="$p1"
+  pause
+}
+
+_sm_cf_bin() {
+  command -v cloudflared 2>/dev/null \
+    || { [ -x /usr/local/bin/cloudflared ] && echo /usr/local/bin/cloudflared; } \
+    || { [ -x /root/cloudflared ] && echo /root/cloudflared; } || true
+}
+
+parse_quick_tunnel_host() {
+  grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' "${1:-$QUICK_SSH_LOG}" 2>/dev/null | head -1 | sed 's|https://||'
+}
+
+stop_quick_temp_ssh_tunnel() {
+  local pid=""
+  [ -f "$QUICK_SSH_PID" ] && pid=$(cat "$QUICK_SSH_PID" 2>/dev/null || true)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true; sleep 1; kill -9 "$pid" 2>/dev/null || true
+  fi
+  pkill -f "cloudflared.*--url tcp://127.0.0.1:22" 2>/dev/null || true
+  rm -f "$QUICK_SSH_PID" "$QUICK_SSH_URL"
+}
+
+sm_stop_quick_temp_ssh() {
+  clear; title "关闭临时 SSH 隧道"
+  stop_quick_temp_ssh_tunnel
+  ok "已停止临时 trycloudflare 隧道"
+  pause
+}
+
+sm_quick_temp_ssh() {
+  clear; title "一键临时 SSH（trycloudflare）"
+  echo "cloudflared tunnel --url tcp://127.0.0.1:22"
+  prepare_ssh_for_tunnel
+  local CFB; CFB=$(_sm_cf_bin)
+  [ -n "$CFB" ] || { err "未找到 cloudflared"; pause; return 1; }
+  port_22_listening || { err ":22 未监听"; pause; return 1; }
+  stop_quick_temp_ssh_tunnel
+  mkdir -p /var/log /run
+  : >"$QUICK_SSH_LOG"
+  info "启动临时隧道..."
+  nohup env -u ALL_PROXY -u HTTPS_PROXY -u HTTP_PROXY -u all_proxy -u https_proxy -u http_proxy \
+    "$CFB" tunnel --no-autoupdate --url "tcp://127.0.0.1:22" >>"$QUICK_SSH_LOG" 2>&1 &
+  echo $! >"$QUICK_SSH_PID"
+  ok "PID=$(cat "$QUICK_SSH_PID") 日志=$QUICK_SSH_LOG"
+  local i host=""
+  for i in $(seq 1 30); do
+    host=$(parse_quick_tunnel_host)
+    [ -n "$host" ] && { echo "$host" >"$QUICK_SSH_URL"; break; }
+    if ! kill -0 "$(cat "$QUICK_SSH_PID" 2>/dev/null)" 2>/dev/null; then
+      err "进程已退出"; tail -15 "$QUICK_SSH_LOG"; pause; return 1
+    fi
+    printf '.'; sleep 1
+  done
+  echo
+  [ -n "$host" ] || { err "未拿到 trycloudflare 域名"; tail -20 "$QUICK_SSH_LOG"; pause; return 1; }
+  ok "就绪: https://${host}"
+  echo "  cloudflared access tcp --hostname ${host} --url 127.0.0.1:2222"
+  echo "  ssh -p 2222 ${QUICK_SSH_USER:-kkb}@127.0.0.1"
+  echo "关闭: 菜单 16"
+  pause
+}
+
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   while true; do
     clear
@@ -1374,17 +1639,28 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     echo -e "${CYAN}${BOLD}║        全能自适应系统服务与详情管理脚本          ║${NC}"
     echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════╝${NC}"
     echo -e " PID1=$(cat /proc/1/comm 2>/dev/null)  管理器=$(get_manager)"
-    echo -e " 请选择你需要执行的操作序号："
+    echo -e " ${ORANGE}—— 核心（已调试）——${NC}"
     echo -e " ${GREEN}1.${NC} 查看系统详情概览"
-    echo -e " ${GREEN}2.${NC} 查看系统 Init 及开机自启项目"
-    echo -e " ${GREEN}3.${NC} Cloudflare 隧道（粘贴/查看/状态/删除 Token）"
-    echo -e " ${GREEN}4.${NC} 配置 SSH 服务开机自启动"
-    echo -e " ${GREEN}5.${NC} Bore 隧道（安装 / 连接 / 开机自启）"
-    echo -e " ${GREEN}6.${NC} 修改 Root 密码（回车=不改）"
-    echo -e " ${GREEN}7.${NC} s6 修复/重挂 CF·SSH 链接（开机 hook 方案1）"
+    echo -e " ${GREEN}2.${NC} 查看 Init / 开机自启（含 ps -p 1）"
+    echo -e " ${GREEN}3.${NC} Cloudflare 隧道（Token 粘贴/重启/查看/状态/删除）"
+    echo -e " ${GREEN}4.${NC} 配置 SSH 自启（hostkey/密码登录/:22）"
+    echo -e " ${GREEN}5.${NC} Bore 隧道"
+    echo -e " ${GREEN}7.${NC} s6 修复/重挂 CF·SSH 链接"
+    echo -e " ${ORANGE}—— SSH/用户/CF 扩展 ——${NC}"
+    echo -e " ${GREEN}8.${NC} 新建用户名和密码"
+    echo -e " ${GREEN}9.${NC} 检查 SSH + 密码登录"
+    echo -e " ${GREEN}10.${NC} 本机验证 SSH"
+    echo -e " ${GREEN}11.${NC} 查看 CF 状态"
+    echo -e " ${GREEN}12.${NC} 修改 Root 密码（回车=不改）"
+    echo -e " ${GREEN}13.${NC} 查看 CF 日志"
+    echo -e " ${GREEN}14.${NC} 卸载 CF 隧道"
+    echo -e " ${GREEN}15.${NC} 一键临时 SSH（trycloudflare）"
+    echo -e " ${GREEN}16.${NC} 关闭临时 SSH 隧道"
+    echo -e " ${GREEN}17.${NC} 修改普通用户密码"
     echo -e " ${RED}0.${NC} 退出脚本"
+    echo -e " ${YELLOW}提示: 自启请用 3/4/7；Init 查看用 2${NC}"
     echo -e "${CYAN}--------------------------------------------------${NC}"
-    printf '%s' "请输入选项 [0-7]: "
+    printf '%s' "请输入选项 [0-17]: "
     read -r choice
 
     case "$choice" in
@@ -1393,8 +1669,18 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
       3) setup_cf_tunnel ;;
       4) setup_ssh ;;
       5) setup_bore ;;
-      6) change_root_passwd ;;
+      6) echo -e "${YELLOW}原 6 已迁到 12${NC}"; change_root_passwd ;;
       7) menu_s6_relink ;;
+      8) sm_create_user ;;
+      9) sm_ssh_password_policy ;;
+      10) sm_local_ssh_test ;;
+      11) sm_cf_status ;;
+      12) change_root_passwd ;;
+      13) sm_cf_logs ;;
+      14) sm_uninstall_cf ;;
+      15) sm_quick_temp_ssh ;;
+      16) sm_stop_quick_temp_ssh ;;
+      17) sm_change_user_password ;;
       0) echo -e "\n感谢使用，再见！"; exit 0 ;;
       *) echo -e "${RED}无效的输入，请重新选择！${NC}" ;;
     esac
